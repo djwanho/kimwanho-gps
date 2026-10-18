@@ -16,11 +16,11 @@ class FavoritePlace {
   final double longitude;
 
   Map<String, Object> toJson() => {
-    'id': id,
-    'name': name,
-    'latitude': latitude,
-    'longitude': longitude,
-  };
+        'id': id,
+        'name': name,
+        'latitude': latitude,
+        'longitude': longitude,
+      };
 
   static FavoritePlace? fromJson(Object? data) {
     if (data is! Map) return null;
@@ -47,11 +47,7 @@ class FavoritePlace {
       return null;
     }
     return FavoritePlace(
-      id: id,
-      name: name,
-      latitude: latitude,
-      longitude: longitude,
-    );
+        id: id, name: name, latitude: latitude, longitude: longitude);
   }
 }
 

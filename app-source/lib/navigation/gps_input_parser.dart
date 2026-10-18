@@ -66,8 +66,9 @@ class GpsInputParser {
           if (parsed != null) return parsed;
         }
       }
-      final pathCoord = RegExp(r'@(' + _number + r'),(' + _number + r')')
-          .firstMatch(uri.path);
+      final pathCoord = RegExp(
+        r'@(' + _number + r'),(' + _number + r')',
+      ).firstMatch(uri.path);
       if (pathCoord != null) {
         return _coordinate(pathCoord.group(1), pathCoord.group(2));
       }
@@ -190,7 +191,9 @@ class GpsInputParser {
       final headers = lines.first
           .toLowerCase()
           .split(',')
-          .map((field) => field.trim().replaceAll('"', ''))
+          .map(
+            (field) => field.trim().replaceAll('"', ''),
+          )
           .toList();
       final latIdx = headers.indexWhere(
         (field) => ['lat', 'latitude', '위도'].contains(field),

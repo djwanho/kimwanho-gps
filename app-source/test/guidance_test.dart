@@ -52,9 +52,9 @@ void main() {
               {'type': 10, 'begin_shape_index': 1},
               {'type': 4, 'begin_shape_index': 2},
             ],
-          },
+          }
         ],
-      },
+      }
     });
     expect(route.points.length, 3);
     expect(route.totalMeters, 80);
@@ -69,13 +69,12 @@ void main() {
     );
     expect(first, contains('우회전'));
     expect(
-      guidance.onGpsFix(
-        pts.first,
-        accuracyMeters: 8,
-        now: DateTime(2026, 10, 12),
-      ),
-      isNull,
-    );
+        guidance.onGpsFix(
+          pts.first,
+          accuracyMeters: 8,
+          now: DateTime(2026, 10, 12),
+        ),
+        isNull);
 
     // 목적지에서는 연속 2회 유효한 GPS 값이 들어와야 도착 알림.
     expect(guidance.onGpsFix(pts.last, accuracyMeters: 6), isNull);

@@ -16,9 +16,8 @@ class SaveFavoriteDialog extends StatefulWidget {
 }
 
 class _SaveFavoriteDialogState extends State<SaveFavoriteDialog> {
-  late final TextEditingController _controller = TextEditingController(
-    text: widget.suggestedName,
-  );
+  late final TextEditingController _controller =
+      TextEditingController(text: widget.suggestedName);
 
   @override
   void dispose() {

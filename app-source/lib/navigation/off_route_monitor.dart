@@ -38,8 +38,7 @@ class OffRouteMonitor {
     // 차량 등 빠른 이동에서 경로 밖 100m 이상으로 멀어진 상황은
     // GPS 정확도가 충분할 때 연속 2회로 조기 재탐색합니다.
     // 일반 보행에서는 기존 3회 조건을 유지합니다.
-    final rapidDeviation =
-        speedMetersPerSecond != null &&
+    final rapidDeviation = speedMetersPerSecond != null &&
         speedMetersPerSecond.isFinite &&
         speedMetersPerSecond >= 8.0 &&
         lateralMeters >= 100.0 &&

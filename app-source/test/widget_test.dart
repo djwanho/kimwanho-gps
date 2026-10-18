@@ -12,7 +12,9 @@ import 'package:walk_pin_navigator/main.dart';
 
 void main() {
   testWidgets('legal page shows app information', (WidgetTester tester) async {
-    await tester.pumpWidget(const MaterialApp(home: AppLegalPage()));
+    await tester.pumpWidget(
+      const MaterialApp(home: AppLegalPage()),
+    );
 
     expect(find.text('좌표 도보 길안내'), findsOneWidget);
     expect(find.textContaining('제작자: 김완호'), findsOneWidget);

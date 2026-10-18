@@ -2,7 +2,7 @@
 
 이 저장소는 공식 배포 홈페이지와 공개 가능한 Flutter 앱 소스를 함께 제공합니다.
 
-- 최신 앱: v1.5.8
+- 최신 앱: v1.5.9
 - APK: GitHub Releases에서 배포
 - 앱 소스: `app-source/`
 - 개인정보 처리방침: `privacy.html`

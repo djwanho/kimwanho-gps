@@ -48,17 +48,14 @@ class WalkingVoiceRoute {
       if (rawIndex is! num || !rawIndex.isFinite) continue;
       final shapeIndex = rawIndex.toInt();
       if (shapeIndex < 0 || shapeIndex >= points.length) continue;
-      maneuvers.add(
-        WalkingManeuver(
-          type: (m['type'] as num).toInt(),
-          shapeIndex: shapeIndex,
-          metersFromStart: distances[shapeIndex],
-        ),
-      );
+      maneuvers.add(WalkingManeuver(
+        type: (m['type'] as num).toInt(),
+        shapeIndex: shapeIndex,
+        metersFromStart: distances[shapeIndex],
+      ));
     }
     // Valhalla distance 단위: kilometers, time 단위: seconds.
-    final summary =
-        trip['summary'] as Map<String, dynamic>? ??
+    final summary = trip['summary'] as Map<String, dynamic>? ??
         leg['summary'] as Map<String, dynamic>? ??
         {};
     final rawLength = summary['length'];
@@ -68,14 +65,13 @@ class WalkingVoiceRoute {
         : null;
     final durationSeconds =
         rawDuration is num && rawDuration.isFinite && rawDuration >= 0
-        ? rawDuration.toDouble()
-        : null;
+            ? rawDuration.toDouble()
+            : null;
     return WalkingVoiceRoute(
       points: points,
       maneuvers: maneuvers,
-      totalMeters: lengthKm == null
-          ? distances.last.round()
-          : (lengthKm * 1000).round(),
+      totalMeters:
+          lengthKm == null ? distances.last.round() : (lengthKm * 1000).round(),
       totalSeconds: durationSeconds?.round() ?? 0,
     );
   }
@@ -130,15 +126,11 @@ class NavigationSnapshot {
   final bool offRoute;
 }
 
-NavigationSnapshot navigationSnapshot(
-  WalkingVoiceRoute route,
-  LatLng position, {
-  RouteMatch? match,
-}) {
+NavigationSnapshot navigationSnapshot(WalkingVoiceRoute route, LatLng position,
+    {RouteMatch? match}) {
   final matched = match ?? route.locate(position);
-  final remaining = math
-      .max(0, route.totalMeters - matched.alongMeters)
-      .round();
+  final remaining =
+      math.max(0, route.totalMeters - matched.alongMeters).round();
   if (matched.lateralMeters > 60) {
     return NavigationSnapshot(
       remainingMeters: remaining,
@@ -280,8 +272,7 @@ class WalkingGuidance {
 
     // GPS 오차나 목적지와 평행한 길 때문에 잘못된 도착 판정을 피함.
     final toDestination = metersBetween(current, route.points.last);
-    final closeToFinish =
-        toDestination <= 20 &&
+    final closeToFinish = toDestination <= 20 &&
         _progressMeters >= route.locate(route.points.last).alongMeters - 55;
     _arrivalFixes = closeToFinish ? _arrivalFixes + 1 : 0;
     if (_arrivalFixes >= 2) {
@@ -359,8 +350,7 @@ double metersBetween(LatLng a, LatLng b) {
   final lat2 = b.latitude * math.pi / 180;
   final dlat = (b.latitude - a.latitude) * math.pi / 180;
   final dlon = (b.longitude - a.longitude) * math.pi / 180;
-  final h =
-      math.sin(dlat / 2) * math.sin(dlat / 2) +
+  final h = math.sin(dlat / 2) * math.sin(dlat / 2) +
       math.cos(lat1) * math.cos(lat2) * math.sin(dlon / 2) * math.sin(dlon / 2);
   return earthRadiusMeters * 2 * math.asin(math.sqrt(h.clamp(0.0, 1.0)));
 }

@@ -31,24 +31,19 @@ void main() {
 
   test('GPX 좌표가 없는 경우 빈 목록', () {
     expect(
-      GpsInputParser.parseFileText(
-        '<gpx><metadata><name>Only metadata</name></metadata></gpx>',
-      ),
-      isEmpty,
-    );
+        GpsInputParser.parseFileText(
+            '<gpx><metadata><name>Only metadata</name></metadata></gpx>'),
+        isEmpty);
   });
 
   test('비정상 GPX 구조는 오류 원인을 알 수 있게 함', () {
-    expect(
-      () => GpsInputParser.parseFileText('<gpx><trkpt></gpx>'),
-      throwsA(isA<FormatException>()),
-    );
+    expect(() => GpsInputParser.parseFileText('<gpx><trkpt></gpx>'),
+        throwsA(isA<FormatException>()));
   });
 
   test('기존 CSV 입력의 호환성 유지', () {
     final points = GpsInputParser.parseFileText(
-      'latitude,longitude\n37.5665,126.978\n37.567,126.979',
-    );
+        'latitude,longitude\n37.5665,126.978\n37.567,126.979');
     expect(points.length, 2);
     expect(points.last.longitude, 126.979);
   });

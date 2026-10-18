@@ -1,7 +1,6 @@
 import 'dart:async';
 import 'dart:convert';
 import 'dart:io' show Platform;
-
 import 'package:http/http.dart' as http;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
@@ -13,12 +12,12 @@ import 'package:latlong2/latlong.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:flutter_tts/flutter_tts.dart';
 import 'package:flutter_compass/flutter_compass.dart';
-
 import 'navigation/direction_sector.dart';
 import 'navigation/favorite_places.dart';
 import 'navigation/save_favorite_dialog.dart';
 import 'navigation/walking_guidance.dart';
 import 'navigation/off_route_monitor.dart';
+import 'navigation/gps_recovery_policy.dart';
 import 'navigation/gps_input_parser.dart';
 
 const _routeEndpoint = String.fromEnvironment(
@@ -58,10 +57,10 @@ class WalkingHomePage extends StatefulWidget {
   State<WalkingHomePage> createState() => _WalkingHomePageState();
 }
 
-class _WalkingHomePageState extends State<WalkingHomePage> {
-  final _destinationController = TextEditingController(
-    text: '37.5665, 126.9780',
-  );
+class _WalkingHomePageState extends State<WalkingHomePage>
+    with WidgetsBindingObserver {
+  final _destinationController =
+      TextEditingController(text: '37.5665, 126.9780');
   final _geocoder = Geocoding();
   bool _resolvingDestination = false;
   int _destinationRequest = 0;
@@ -106,6 +105,16 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
   DateTime? _lastMapMoveAt;
   DateTime? _lastGpsReceivedAt;
   Timer? _gpsHealthTicker;
+  // 스트림과 단발성 위치 조회를 분리하여, 스트림 중단을 조용히 숨기지 않습니다.
+  Future<void> _gpsStreamOperation = Future<void>.value();
+  int _gpsStreamGeneration = 0;
+  DateTime? _gpsStreamOpenedAt;
+  DateTime? _lastGpsStreamFixAt;
+  DateTime? _lastGpsPollAt;
+  DateTime? _lastGpsRestartAt;
+  bool _gpsPollBusy = false;
+  bool _gpsRestartBusy = false;
+  bool _gpsPermissionReady = false;
   int _gpsDiagnosticFixCount = 0;
   bool _ttsAvailable = true;
   int _speechEpoch = 0;
@@ -114,13 +123,15 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     _ttsSetup = _configureTts();
     _startLocationUpdates();
-    _gpsHealthTicker = Timer.periodic(const Duration(seconds: 5), (_) {
-      if (mounted && !_isInPip) {
-        // 갱신이 멈춘 상태를 정적 지도 화면에서도 확인할 수 있도록 표시.
-        setState(() {});
-      }
+    _gpsHealthTicker = Timer.periodic(const Duration(seconds: 4), (_) {
+      if (!mounted) return;
+      // 이 타이머는 화면만 다시 그리는 것이 아니라 GPS 수신 중단을
+      // 감지하여 현재 위치 조회 + 실시간 스트림 복구까지 실행합니다.
+      if (!_isInPip) setState(() {});
+      _checkGpsHealth();
     });
     _loadFavorites();
     _setupPictureInPicture();
@@ -171,10 +182,21 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
   }
 
   @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.resumed && _gpsPermissionReady) {
+      // 통화/다른 앱에서 돌아오면 오래된 지도 점을 두지 않습니다.
+      unawaited(_pollGpsOnce(force: true));
+      _checkGpsHealth();
+    }
+  }
+
+  @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     _navigationEpoch++;
     _initialRouteEpoch++;
     _gpsHealthTicker?.cancel();
+    _gpsStreamGeneration++; // 종료 후 도착한 이전 스트림 이벤트 무효화.
     _locationSubscription?.cancel();
     _compassSubscription?.cancel();
     _tts.stop();
@@ -228,9 +250,13 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
   }
 
   void _startCompass() {
-    if (_compassSubscription != null) return;
+    if (_compassSubscription != null) {
+      return;
+    }
     final stream = FlutterCompass.events;
-    if (stream == null) return; // 나침반이 없는 기기에서는 이동방향만 활용
+    if (stream == null) {
+      return; // 나침반이 없는 기기에서는 이동방향만 활용
+    }
     _compassSubscription = stream.listen(
       (event) {
         final heading = event.heading;
@@ -313,39 +339,34 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     final choice = await showModalBottomSheet<String>(
       context: context,
       builder: (context) => SafeArea(
-        child: Column(
-          mainAxisSize: MainAxisSize.min,
-          children: [
-            const ListTile(
-              title: Text('즐겨찾기에 저장할 위치'),
-              subtitle: Text('길게 누른 장소 또는 현재 GPS 위치를 선택하세요.'),
+        child: Column(mainAxisSize: MainAxisSize.min, children: [
+          const ListTile(
+            title: Text('즐겨찾기에 저장할 위치'),
+            subtitle: Text('길게 누른 장소 또는 현재 GPS 위치를 선택하세요.'),
+          ),
+          ListTile(
+            leading: const Icon(Icons.place_outlined),
+            title: const Text('지도에서 누른 지점 저장'),
+            subtitle: Text(
+              '${pressed.latitude.toStringAsFixed(6)}, '
+              '${pressed.longitude.toStringAsFixed(6)}',
             ),
-            ListTile(
-              leading: const Icon(Icons.place_outlined),
-              title: const Text('지도에서 누른 지점 저장'),
-              subtitle: Text(
-                '${pressed.latitude.toStringAsFixed(6)}, '
-                '${pressed.longitude.toStringAsFixed(6)}',
-              ),
-              onTap: () => Navigator.pop(context, 'pressed'),
-            ),
-            ListTile(
-              enabled: _position != null,
-              leading: const Icon(Icons.my_location),
-              title: const Text('내 현재 GPS 위치 저장'),
-              subtitle: Text(
-                _position == null
-                    ? 'GPS 신호를 먼저 확인하세요.'
-                    : '${_position!.latitude.toStringAsFixed(6)}, '
-                          '${_position!.longitude.toStringAsFixed(6)}',
-              ),
-              onTap: _position == null
-                  ? null
-                  : () => Navigator.pop(context, 'current'),
-            ),
-            const SizedBox(height: 12),
-          ],
-        ),
+            onTap: () => Navigator.pop(context, 'pressed'),
+          ),
+          ListTile(
+            enabled: _position != null,
+            leading: const Icon(Icons.my_location),
+            title: const Text('내 현재 GPS 위치 저장'),
+            subtitle: Text(_position == null
+                ? 'GPS 신호를 먼저 확인하세요.'
+                : '${_position!.latitude.toStringAsFixed(6)}, '
+                    '${_position!.longitude.toStringAsFixed(6)}'),
+            onTap: _position == null
+                ? null
+                : () => Navigator.pop(context, 'current'),
+          ),
+          const SizedBox(height: 12),
+        ]),
       ),
     );
     if (!mounted || choice == null) return;
@@ -359,10 +380,8 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     );
   }
 
-  Future<void> _saveFavoriteAt(
-    LatLng coords, {
-    required String suggestedName,
-  }) async {
+  Future<void> _saveFavoriteAt(LatLng coords,
+      {required String suggestedName}) async {
     final name = await showDialog<String>(
       context: context,
       builder: (_) => SaveFavoriteDialog(
@@ -383,8 +402,9 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     );
     await _persistFavorites([..._favorites, place]);
     if (mounted && _favorites.any((x) => x.id == place.id)) {
-      ScaffoldMessenger.of(context)
-          .showSnackBar(SnackBar(content: Text('즐겨찾기 "$name"을 저장했습니다.')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(content: Text('즐겨찾기 "$name"을 저장했습니다.')),
+      );
     }
   }
 
@@ -395,77 +415,68 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
       builder: (sheetContext) => SafeArea(
         child: SizedBox(
           height: MediaQuery.of(sheetContext).size.height * .55,
-          child: Column(
-            children: [
-              const ListTile(
-                title: Text('즐겨찾기'),
-                subtitle: Text('장소를 선택하면 목적지로 지정하고 도보 경로를 조회합니다.'),
-              ),
-              Expanded(
-                child: _favorites.isEmpty
-                    ? const Center(
-                        child: Text(
-                          '저장된 장소가 없습니다.\n지도에서 꾹 눌러 저장해 보세요.',
-                          textAlign: TextAlign.center,
-                        ),
-                      )
-                    : ListView.builder(
-                        itemCount: _favorites.length,
-                        itemBuilder: (context, i) {
-                          final place = _favorites[i];
-                          return ListTile(
-                            leading: const Icon(
-                              Icons.star,
-                              color: Colors.amber,
-                            ),
-                            title: Text(place.name),
-                            subtitle: Text(
-                              '${place.latitude.toStringAsFixed(6)}, '
-                              '${place.longitude.toStringAsFixed(6)}',
-                            ),
-                            onTap: () {
+          child: Column(children: [
+            const ListTile(
+              title: Text('즐겨찾기'),
+              subtitle: Text('장소를 선택하면 목적지로 지정하고 도보 경로를 조회합니다.'),
+            ),
+            Expanded(
+              child: _favorites.isEmpty
+                  ? const Center(
+                      child: Text(
+                      '저장된 장소가 없습니다.\n지도에서 꾹 눌러 저장해 보세요.',
+                      textAlign: TextAlign.center,
+                    ))
+                  : ListView.builder(
+                      itemCount: _favorites.length,
+                      itemBuilder: (context, i) {
+                        final place = _favorites[i];
+                        return ListTile(
+                          leading: const Icon(Icons.star, color: Colors.amber),
+                          title: Text(place.name),
+                          subtitle: Text(
+                            '${place.latitude.toStringAsFixed(6)}, '
+                            '${place.longitude.toStringAsFixed(6)}',
+                          ),
+                          onTap: () {
+                            Navigator.pop(sheetContext);
+                            _selectFavorite(place);
+                          },
+                          trailing: IconButton(
+                            icon: const Icon(Icons.delete_outline),
+                            tooltip: '${place.name} 삭제',
+                            onPressed: () async {
                               Navigator.pop(sheetContext);
-                              _selectFavorite(place);
+                              final approved = await showDialog<bool>(
+                                context: this.context,
+                                builder: (ctx) => AlertDialog(
+                                  title: const Text('즐겨찾기 삭제'),
+                                  content: Text('"${place.name}"을 삭제하시겠습니까?'),
+                                  actions: [
+                                    TextButton(
+                                      onPressed: () =>
+                                          Navigator.pop(ctx, false),
+                                      child: const Text('취소'),
+                                    ),
+                                    FilledButton(
+                                      onPressed: () => Navigator.pop(ctx, true),
+                                      child: const Text('삭제'),
+                                    ),
+                                  ],
+                                ),
+                              );
+                              if (approved == true && mounted) {
+                                await _persistFavorites(_favorites
+                                    .where((x) => x.id != place.id)
+                                    .toList());
+                              }
                             },
-                            trailing: IconButton(
-                              icon: const Icon(Icons.delete_outline),
-                              tooltip: '${place.name} 삭제',
-                              onPressed: () async {
-                                Navigator.pop(sheetContext);
-                                final approved = await showDialog<bool>(
-                                  context: this.context,
-                                  builder: (ctx) => AlertDialog(
-                                    title: const Text('즐겨찾기 삭제'),
-                                    content: Text('"${place.name}"을 삭제하시겠습니까?'),
-                                    actions: [
-                                      TextButton(
-                                        onPressed: () =>
-                                            Navigator.pop(ctx, false),
-                                        child: const Text('취소'),
-                                      ),
-                                      FilledButton(
-                                        onPressed: () =>
-                                            Navigator.pop(ctx, true),
-                                        child: const Text('삭제'),
-                                      ),
-                                    ],
-                                  ),
-                                );
-                                if (approved == true && mounted) {
-                                  await _persistFavorites(
-                                    _favorites
-                                        .where((x) => x.id != place.id)
-                                        .toList(),
-                                  );
-                                }
-                              },
-                            ),
-                          );
-                        },
-                      ),
-              ),
-            ],
-          ),
+                          ),
+                        );
+                      },
+                    ),
+            ),
+          ]),
         ),
       ),
     );
@@ -510,6 +521,12 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
         return;
       }
       _lastGpsReceivedAt = DateTime.now();
+      // 경로 매칭이나 회전 안내가 실패하더라도 파란 현재 위치 점은
+      // 반드시 최신 GPS 좌표로 먼저 업데이트해야 합니다.
+      setState(() => _position = p);
+      if (_followGps && _fullScreenNavigation) {
+        _centerOnCurrentLocation();
+      }
       // 새 위치는 기록하되 보행 경로 선분 매칭은 GPS 1회당 한 번만 수행합니다.
       // 자동차 속도로 좌표가 바뀌어도 렌더링에서 같은 경로를 반복 계산하지 않습니다.
       final guide = _guidance;
@@ -525,17 +542,14 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
       }
       _lastMatchedRoute = navigating ? guide.route : null;
       _lastRouteMatch = match;
-      setState(() => _position = p);
-      if (_fullScreenNavigation && _followGps) _centerOnCurrentLocation();
-
-      if (!navigating || _rerouting || match == null) return;
+      if (!navigating || _rerouting || match == null) {
+        return;
+      }
       _gpsDiagnosticFixCount++;
       if (_gpsDiagnosticFixCount % 15 == 0) {
-        debugPrint(
-          '[NAV-GPS] speed=${p.speed.toStringAsFixed(1)}m/s '
-          'accuracy=${p.accuracy.toStringAsFixed(1)}m '
-          'deviation=${match.lateralMeters.toStringAsFixed(0)}m',
-        );
+        debugPrint('[NAV-GPS] speed=${p.speed.toStringAsFixed(1)}m/s '
+            'accuracy=${p.accuracy.toStringAsFixed(1)}m '
+            'deviation=${match.lateralMeters.toStringAsFixed(0)}m');
       }
       // 지름길로 목적지에 바로 도착한 경우 기존 경로선 위에 없더라도
       // 연속 2회 정확한 측정값으로 도착을 판단합니다.
@@ -556,7 +570,10 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
         });
         unawaited(_setPipNavigationActive(false));
         unawaited(_setNavigationLocationMode(false));
-        unawaited(_speak('목적지 근처에 도착했습니다. 주변을 확인하세요.', isTest: true));
+        unawaited(_speak(
+          '목적지 근처에 도착했습니다. 주변을 확인하세요.',
+          isTest: true,
+        ));
         return;
       }
       final shouldReroute = _offRouteMonitor.observe(
@@ -566,10 +583,8 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
         now: DateTime.now(),
       );
       if (shouldReroute) {
-        debugPrint(
-          '[NAV-REROUTE] trigger '
-          'deviation=${match.lateralMeters.toStringAsFixed(0)}m',
-        );
+        debugPrint('[NAV-REROUTE] trigger '
+            'deviation=${match.lateralMeters.toStringAsFixed(0)}m');
         unawaited(_rerouteFromPosition(p));
         return;
       }
@@ -602,7 +617,10 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
         _stopCompass();
         unawaited(_setPipNavigationActive(false));
         unawaited(_setNavigationLocationMode(false));
-        unawaited(_speak(message ?? '목적지 근처에 도착했습니다.', isTest: true));
+        unawaited(_speak(
+          message ?? '목적지 근처에 도착했습니다.',
+          isTest: true,
+        ));
         return;
       }
       if (message != null) {
@@ -638,11 +656,11 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
   }
 
   /// 현재 위치에서 기존 목적지로 요청하며, 실패해도 이전 경로와 지도를 유지합니다.
-  Future<void> _rerouteFromPosition(
-    Position location, {
-    bool manual = false,
-  }) async {
-    if (_rerouting || !_voiceOn || !_fullScreenNavigation || !mounted) return;
+  Future<void> _rerouteFromPosition(Position location,
+      {bool manual = false}) async {
+    if (_rerouting || !_voiceOn || !_fullScreenNavigation || !mounted) {
+      return;
+    }
     if (!location.latitude.isFinite ||
         !location.longitude.isFinite ||
         location.latitude.abs() > 90 ||
@@ -660,12 +678,10 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     final destination = _destination;
     final startingPoint = LatLng(location.latitude, location.longitude);
     if (manual) _offRouteMonitor.markAttempt(DateTime.now());
-    debugPrint(
-      '[NAV-REROUTE] start manual=$manual '
-      'speed=${location.speed.toStringAsFixed(1)}m/s '
-      'lat=${location.latitude.toStringAsFixed(6)} '
-      'lon=${location.longitude.toStringAsFixed(6)}',
-    );
+    debugPrint('[NAV-REROUTE] start manual=$manual '
+        'speed=${location.speed.toStringAsFixed(1)}m/s '
+        'lat=${location.latitude.toStringAsFixed(6)} '
+        'lon=${location.longitude.toStringAsFixed(6)}');
 
     setState(() {
       _rerouting = true;
@@ -902,92 +918,190 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     setState(() => _locating = true);
     try {
       if (!await _ensureLocationPermission()) return;
-      // 초기 getCurrentPosition이 실내/고속 이동에서 지연되거나 실패해도
-      // 연속 GPS 스트림은 계속 살아 있도록 먼저 등록합니다.
+      _gpsPermissionReady = true;
+      // GPS 스트림부터 구독합니다. 단발 조회가 느려져도 추적은 유지됩니다.
       await _replaceLocationStream(foreground: _foregroundLocation);
       if (!mounted) return;
-      _notify('GPS 연속 위치 추적이 시작됐습니다.');
-      try {
-        final first = await Geolocator.getCurrentPosition(
-          locationSettings: const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            timeLimit: Duration(seconds: 8),
-          ),
-        );
-        if (mounted) _onPosition(first);
-      } catch (error) {
-        debugPrint('[NAV-GPS] initial fix skipped: $error');
-        // 스트림에서 늦게 도착하는 정상 측정값을 기다립니다.
-      }
+      _notify('GPS 실시간 위치 추적이 연결됐습니다.');
+      // 초기 좌표만 가져오고 끝내지 않고, 계속 스트림을 유지합니다.
+      await _pollGpsOnce(force: true);
     } catch (e, stack) {
-      debugPrint('[NAV-GPS] stream startup failed: $e\\n$stack');
-      _notify('GPS 연결 오류: 위치 권한 및 위치 서비스를 확인하세요.');
+      debugPrint('[NAV-GPS] stream startup failed: $e\n$stack');
+      _notify('GPS 연결 오류: 위치 권한과 위치 서비스를 확인하세요.');
     } finally {
       if (mounted) setState(() => _locating = false);
     }
   }
 
-  Future<void> _replaceLocationStream({required bool foreground}) async {
-    // Geolocator's Android foreground notification keeps GPS running when
-    // navigation is started and the app becomes a PiP window or loses focus.
-    await _locationSubscription?.cancel();
-    _locationSubscription = null;
-    final LocationSettings settings = Platform.isAndroid
-        ? AndroidSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 5,
-            intervalDuration: const Duration(seconds: 2),
-            foregroundNotificationConfig: foreground
-                ? const ForegroundNotificationConfig(
-                    notificationTitle: '김완호 GPS 도보 길안내',
-                    notificationText: '도보 안내 중 · 위치정보를 사용합니다',
-                    enableWakeLock: true,
-                  )
-                : null,
-          )
-        : const LocationSettings(
-            accuracy: LocationAccuracy.high,
-            distanceFilter: 5,
-          );
-    _locationSubscription =
-        Geolocator.getPositionStream(locationSettings: settings).listen(
-          _onPosition,
-          onError: (Object error) {
-            debugPrint('GPS stream failure: $error');
-            _notify('GPS 갱신 오류: 위치 서비스 및 권한을 확인하세요.');
-          },
-        );
+  Future<void> _replaceLocationStream({required bool foreground}) {
+    // 화면 이동, 음성안내 시작, GPS 자동복구의 동시 요청을 순서대로 처리.
+    final generation = ++_gpsStreamGeneration;
+    final operation = _gpsStreamOperation.catchError((Object error) {
+      debugPrint('[NAV-GPS] previous stream operation: $error');
+    }).then((_) async {
+      if (!mounted || generation != _gpsStreamGeneration) return;
+      await _locationSubscription?.cancel();
+      _locationSubscription = null;
+      if (!mounted || generation != _gpsStreamGeneration) return;
+
+      final LocationSettings settings = Platform.isAndroid
+          ? AndroidSettings(
+              accuracy: LocationAccuracy.high,
+              // 기존 5m 거리 필터로 인해 정지/저속 이동에서 위치가
+              // 지나치게 늦게 갱신되는 현상을 피합니다.
+              distanceFilter: 0,
+              intervalDuration: const Duration(seconds: 2),
+              foregroundNotificationConfig: foreground
+                  ? const ForegroundNotificationConfig(
+                      notificationTitle: '김완호 GPS 도보 길안내',
+                      notificationText: '실시간 위치와 도보 안내를 사용합니다',
+                      enableWakeLock: true,
+                    )
+                  : null,
+            )
+          : const LocationSettings(
+              accuracy: LocationAccuracy.high,
+              distanceFilter: 0,
+            );
+      _gpsStreamOpenedAt = DateTime.now();
+      _lastGpsStreamFixAt = null;
+      _locationSubscription = Geolocator.getPositionStream(
+        locationSettings: settings,
+      ).listen(
+        (position) {
+          if (!mounted || generation != _gpsStreamGeneration) return;
+          _lastGpsStreamFixAt = DateTime.now();
+          _onPosition(position);
+        },
+        onError: (Object error) {
+          if (!mounted || generation != _gpsStreamGeneration) return;
+          debugPrint('[NAV-GPS] position stream error: $error');
+          _notify('GPS 신호가 중단되어 자동으로 다시 연결하고 있습니다.');
+          // onError 이후 스트림이 살아 있다고 가정하지 않습니다.
+          unawaited(_restartGpsStream(reason: 'stream error'));
+        },
+        onDone: () {
+          if (!mounted || generation != _gpsStreamGeneration) return;
+          debugPrint('[NAV-GPS] position stream completed unexpectedly');
+          unawaited(_restartGpsStream(reason: 'stream completed'));
+        },
+        cancelOnError: false,
+      );
+      debugPrint('[NAV-GPS] stream subscribed: foreground=$foreground '
+          'generation=$generation');
+    });
+    _gpsStreamOperation = operation;
+    return operation;
   }
 
   Future<void> _setNavigationLocationMode(bool active) {
-    if (_foregroundLocation == active) return _locationModeOperation;
+    if (_foregroundLocation == active && _locationSubscription != null) {
+      return _locationModeOperation;
+    }
     _foregroundLocation = active;
-    // Serialize changes: quick start/stop must not leave an old foreground
-    // subscription running after navigation is finished.
-    _locationModeOperation = _locationModeOperation
-        .then((_) async {
-          if (!mounted) return;
-          final wanted = _foregroundLocation;
-          try {
-            await _replaceLocationStream(foreground: wanted);
-          } catch (e) {
-            if (!mounted) return;
-            debugPrint('GPS foreground mode unavailable: $e');
-            if (wanted) {
-              _foregroundLocation = false;
-              _notify('백그라운드 GPS 활성화 실패: 화면 전환 시 안내가 중단될 수 있습니다.');
-            }
-            try {
-              await _replaceLocationStream(foreground: false);
-            } catch (fallbackError) {
-              debugPrint('GPS fallback also failed: $fallbackError');
-            }
-          }
-        })
-        .catchError((Object error) {
-          debugPrint('GPS mode update failed: $error');
-        });
+    _locationModeOperation = _locationModeOperation.then((_) async {
+      if (!mounted || !_gpsPermissionReady) return;
+      try {
+        await _replaceLocationStream(foreground: _foregroundLocation);
+      } catch (error) {
+        debugPrint('[NAV-GPS] foreground stream failed: $error');
+        if (_foregroundLocation) {
+          _foregroundLocation = false;
+          _notify('백그라운드 위치 서비스를 시작하지 못했습니다. '
+              '화면을 켠 상태로 안내해 주세요.');
+        }
+        try {
+          await _replaceLocationStream(foreground: false);
+        } catch (fallbackError) {
+          debugPrint('[NAV-GPS] foreground fallback failed: $fallbackError');
+        }
+      }
+    }).catchError((Object error) {
+      debugPrint('[NAV-GPS] location mode update failed: $error');
+    });
     return _locationModeOperation;
+  }
+
+  void _checkGpsHealth() {
+    if (!mounted || !_gpsPermissionReady || _locating) return;
+    final now = DateTime.now();
+    final baseline = _lastGpsStreamFixAt ?? _gpsStreamOpenedAt;
+    if (baseline == null) {
+      unawaited(_restartGpsStream(reason: 'no stream'));
+      return;
+    }
+    final silentFor = now.difference(baseline);
+    if (GpsRecoveryPolicy.shouldPoll(
+      streamSilentFor: silentFor,
+      sinceLastPoll:
+          _lastGpsPollAt == null ? null : now.difference(_lastGpsPollAt!),
+      pollBusy: _gpsPollBusy,
+    )) {
+      unawaited(_pollGpsOnce());
+    }
+    if (GpsRecoveryPolicy.shouldRestart(
+      streamSilentFor: silentFor,
+      sinceLastRestart:
+          _lastGpsRestartAt == null ? null : now.difference(_lastGpsRestartAt!),
+      restartBusy: _gpsRestartBusy,
+    )) {
+      unawaited(
+          _restartGpsStream(reason: 'stream silent ${silentFor.inSeconds}s'));
+    }
+  }
+
+  Future<void> _pollGpsOnce({bool force = false}) async {
+    if (_gpsPollBusy || !mounted || !_gpsPermissionReady) return;
+    final now = DateTime.now();
+    if (!force &&
+        _lastGpsPollAt != null &&
+        now.difference(_lastGpsPollAt!) < GpsRecoveryPolicy.pollInterval) {
+      return;
+    }
+    _lastGpsPollAt = now;
+    _gpsPollBusy = true;
+    try {
+      final current = await Geolocator.getCurrentPosition(
+        locationSettings: const LocationSettings(
+          accuracy: LocationAccuracy.high,
+          timeLimit: Duration(seconds: 7),
+        ),
+      );
+      if (mounted) _onPosition(current);
+    } catch (error) {
+      debugPrint('[NAV-GPS] fallback current position failed: $error');
+    } finally {
+      _gpsPollBusy = false;
+    }
+  }
+
+  Future<void> _restartGpsStream({required String reason}) async {
+    if (!mounted || !_gpsPermissionReady || _gpsRestartBusy) return;
+    final now = DateTime.now();
+    if (_lastGpsRestartAt != null &&
+        now.difference(_lastGpsRestartAt!) <
+            GpsRecoveryPolicy.restartInterval) {
+      return;
+    }
+    _gpsRestartBusy = true;
+    _lastGpsRestartAt = now;
+    debugPrint('[NAV-GPS] recovering GPS stream: $reason');
+    try {
+      await _replaceLocationStream(foreground: _foregroundLocation);
+    } catch (error) {
+      debugPrint('[NAV-GPS] restart failed: $error');
+      if (_foregroundLocation) {
+        // 서비스 실행 권한/OS 제약으로 실패하면 화면 내 추적부터 복구.
+        _foregroundLocation = false;
+        try {
+          await _replaceLocationStream(foreground: false);
+        } catch (fallbackError) {
+          debugPrint('[NAV-GPS] fallback restart failed: $fallbackError');
+        }
+      }
+    } finally {
+      _gpsRestartBusy = false;
+    }
   }
 
   String get _gpsHealthText {
@@ -998,9 +1112,17 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     final accuracy = position.accuracy.isFinite
         ? '정확도 약 ${position.accuracy.round()}m'
         : '정확도 알 수 없음';
-    if (elapsed > 30) {
-      // distanceFilter가 켜진 상태에서는 정지해 있을 때도 수신이 뜸할 수 있음.
-      return '최근 GPS $elapsed초 전 · $accuracy (정차 또는 갱신 지연)';
+    final streamBaseline = _lastGpsStreamFixAt ?? _gpsStreamOpenedAt;
+    final streamAge = streamBaseline == null
+        ? null
+        : DateTime.now().difference(streamBaseline).inSeconds;
+    if (_gpsPermissionReady &&
+        streamAge != null &&
+        streamAge >= GpsRecoveryPolicy.pollAfter.inSeconds) {
+      return 'GPS 실시간 연결 복구 중 · 최근 위치 $elapsed초 전 · $accuracy';
+    }
+    if (elapsed > 15) {
+      return '최근 GPS $elapsed초 전 · $accuracy (수신 지연)';
     }
     return 'GPS $elapsed초 전 · $accuracy';
   }
@@ -1032,18 +1154,15 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
       if (le || be) {
         final units = <int>[];
         for (var i = 2; i + 1 < bytes.length; i += 2) {
-          units.add(
-            le
-                ? bytes[i] | (bytes[i + 1] << 8)
-                : (bytes[i] << 8) | bytes[i + 1],
-          );
+          units.add(le
+              ? bytes[i] | (bytes[i + 1] << 8)
+              : (bytes[i] << 8) | bytes[i + 1]);
         }
         return String.fromCharCodes(units);
       }
     }
     // UTF-8 BOM 포함 파일도 GPX XML 파서가 읽을 수 있도록 제거.
-    final offset =
-        bytes.length >= 3 &&
+    final offset = bytes.length >= 3 &&
             bytes[0] == 0xEF &&
             bytes[1] == 0xBB &&
             bytes[2] == 0xBF
@@ -1136,10 +1255,8 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
       await _loadWalkingRoute();
       if (!mounted) return;
       if (_voiceRoute != null) {
-        _notify(
-          'GPS 파일에서 목적지를 설정하고 도보 경로를 표시했습니다. '
-          '한국어 음성안내 시작을 누르세요.',
-        );
+        _notify('GPS 파일에서 목적지를 설정하고 도보 경로를 표시했습니다. '
+            '한국어 음성안내 시작을 누르세요.');
       }
     } on FormatException catch (e) {
       _notify('GPX 파일 형식 오류: ${e.message}');
@@ -1170,8 +1287,7 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
       caseSensitive: false,
     ).hasMatch(input)) {
       _notify(
-        '좌표 형식을 확인하세요. 예: 37.5665, 126.9780 또는 37°33\'59.4"N 126°58\'40.8"E',
-      );
+          '좌표 형식을 확인하세요. 예: 37.5665, 126.9780 또는 37°33\'59.4"N 126°58\'40.8"E');
       return;
     }
 
@@ -1195,12 +1311,10 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
         context: context,
         builder: (context) => AlertDialog(
           title: const Text('주소 검색 결과 확인'),
-          content: Text(
-            '입력한 주소: $input\n\n'
-            '위도: ${target.latitude.toStringAsFixed(6)}\n'
-            '경도: ${target.longitude.toStringAsFixed(6)}\n\n'
-            '이 좌표를 목적지로 설정하시겠습니까?',
-          ),
+          content: Text('입력한 주소: $input\n\n'
+              '위도: ${target.latitude.toStringAsFixed(6)}\n'
+              '경도: ${target.longitude.toStringAsFixed(6)}\n\n'
+              '이 좌표를 목적지로 설정하시겠습니까?'),
           actions: [
             TextButton(
               onPressed: () => Navigator.pop(context, false),
@@ -1241,8 +1355,7 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
       _walkingSeconds = null;
       _destination = target;
       _destinationLabel = label;
-      _status =
-          '목적지: ${target.latitude.toStringAsFixed(6)}, '
+      _status = '목적지: ${target.latitude.toStringAsFixed(6)}, '
           '${target.longitude.toStringAsFixed(6)}';
     });
     _mapController.move(target, 16);
@@ -1372,7 +1485,10 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
       'dir_action': 'navigate',
     });
     try {
-      final ok = await launchUrl(uri, mode: LaunchMode.externalApplication);
+      final ok = await launchUrl(
+        uri,
+        mode: LaunchMode.externalApplication,
+      );
       if (!ok) _notify('구글 지도 길찾기를 열지 못했습니다.');
     } catch (e) {
       _notify('도보 길찾기 실행 오류: $e');
@@ -1492,18 +1608,15 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     final current = _position;
     final route = _voiceRoute;
     final snapshot = current != null && route != null
-        ? navigationSnapshot(
-            route,
-            LatLng(current.latitude, current.longitude),
-            match: identical(route, _lastMatchedRoute) ? _lastRouteMatch : null,
-          )
+        ? navigationSnapshot(route, LatLng(current.latitude, current.longitude),
+            match: identical(route, _lastMatchedRoute) ? _lastRouteMatch : null)
         : null;
     final remaining = snapshot?.remainingMeters;
     final remainingText = remaining == null
         ? 'GPS 수신 중'
         : remaining >= 1000
-        ? '${(remaining / 1000).toStringAsFixed(1)}km'
-        : '${remaining}m';
+            ? '${(remaining / 1000).toStringAsFixed(1)}km'
+            : '${remaining}m';
 
     // Only the map and one short instruction remain in the small system PiP
     // surface. The Android system manages resizing, drag, close and expand.
@@ -1556,17 +1669,15 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
     final route = _voiceRoute;
     final snapshot = (p == null || route == null)
         ? null
-        : navigationSnapshot(
-            route,
-            LatLng(p.latitude, p.longitude),
-            match: identical(route, _lastMatchedRoute) ? _lastRouteMatch : null,
-          );
+        : navigationSnapshot(route, LatLng(p.latitude, p.longitude),
+            match:
+                identical(route, _lastMatchedRoute) ? _lastRouteMatch : null);
     final remaining = snapshot?.remainingMeters;
     final distanceText = remaining == null
         ? 'GPS 위치 확인 중'
         : remaining >= 1000
-        ? '${(remaining / 1000).toStringAsFixed(2)}km 남음'
-        : '${remaining}m 남음';
+            ? '${(remaining / 1000).toStringAsFixed(2)}km 남음'
+            : '${remaining}m 남음';
 
     return Stack(
       children: [
@@ -1583,10 +1694,8 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                   color: const Color(0xFF173E72),
                   borderRadius: BorderRadius.circular(16),
                   child: Padding(
-                    padding: const EdgeInsets.symmetric(
-                      horizontal: 8,
-                      vertical: 10,
-                    ),
+                    padding:
+                        const EdgeInsets.symmetric(horizontal: 8, vertical: 10),
                     child: Row(
                       children: [
                         IconButton(
@@ -1603,30 +1712,27 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                                 _rerouting
                                     ? '경로 재탐색 중...'
                                     : _rerouteFailed
-                                    ? '재탐색 실패 · 다시 시도하세요'
-                                    : (p != null &&
-                                          p.accuracy.isFinite &&
-                                          p.accuracy <= 35 &&
-                                          route != null &&
-                                          (identical(
-                                                        route,
-                                                        _lastMatchedRoute,
-                                                      ) &&
-                                                      _lastRouteMatch != null
-                                                  ? _lastRouteMatch!
-                                                        .lateralMeters
-                                                  : route
-                                                        .locate(
-                                                          LatLng(
-                                                            p.latitude,
-                                                            p.longitude,
-                                                          ),
-                                                        )
-                                                        .lateralMeters) >
-                                              30)
-                                    ? '경로 이탈 확인 중...'
-                                    : (snapshot?.nextInstruction ??
-                                          'GPS 위치를 확인하고 있습니다.'),
+                                        ? '재탐색 실패 · 다시 시도하세요'
+                                        : (p != null &&
+                                                p.accuracy.isFinite &&
+                                                p.accuracy <= 35 &&
+                                                route != null &&
+                                                (identical(route,
+                                                                _lastMatchedRoute) &&
+                                                            _lastRouteMatch !=
+                                                                null
+                                                        ? _lastRouteMatch!
+                                                            .lateralMeters
+                                                        : route
+                                                            .locate(LatLng(
+                                                              p.latitude,
+                                                              p.longitude,
+                                                            ))
+                                                            .lateralMeters) >
+                                                    30)
+                                            ? '경로 이탈 확인 중...'
+                                            : (snapshot?.nextInstruction ??
+                                                'GPS 위치를 확인하고 있습니다.'),
                                 maxLines: 2,
                                 overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(
@@ -1639,9 +1745,7 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                               Text(
                                 '$distanceText · ${_voiceOn ? "음성안내 중" : "음성안내 종료"}',
                                 style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 13,
-                                ),
+                                    color: Colors.white70, fontSize: 13),
                               ),
                               const SizedBox(height: 2),
                               Text(
@@ -1649,9 +1753,7 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                                 maxLines: 1,
                                 overflow: TextOverflow.ellipsis,
                                 style: const TextStyle(
-                                  color: Colors.white70,
-                                  fontSize: 11,
-                                ),
+                                    color: Colors.white70, fontSize: 11),
                               ),
                             ],
                           ),
@@ -1695,8 +1797,7 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                         tooltip: _followGps ? '위치 자동 따라가기 끄기' : '현재 위치 따라가기',
                         onPressed: _toggleGpsFollow,
                         child: Icon(
-                          _followGps ? Icons.gps_fixed : Icons.gps_not_fixed,
-                        ),
+                            _followGps ? Icons.gps_fixed : Icons.gps_not_fixed),
                       ),
                     ],
                   ),
@@ -1716,9 +1817,7 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                           maxLines: 1,
                           overflow: TextOverflow.ellipsis,
                           style: const TextStyle(
-                            fontSize: 14,
-                            fontWeight: FontWeight.w600,
-                          ),
+                              fontSize: 14, fontWeight: FontWeight.w600),
                         ),
                         const SizedBox(height: 5),
                         Text(
@@ -1775,19 +1874,17 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
         height: 48,
         child: const Icon(Icons.location_pin, color: Colors.red, size: 48),
       ),
-      ..._favorites.map(
-        (place) => Marker(
-          point: LatLng(place.latitude, place.longitude),
-          width: 40,
-          height: 40,
-          child: IconButton(
-            tooltip: place.name,
-            padding: EdgeInsets.zero,
-            icon: const Icon(Icons.star, color: Colors.amber, size: 32),
-            onPressed: _showFavorites,
-          ),
-        ),
-      ),
+      ..._favorites.map((place) => Marker(
+            point: LatLng(place.latitude, place.longitude),
+            width: 40,
+            height: 40,
+            child: IconButton(
+              tooltip: place.name,
+              padding: EdgeInsets.zero,
+              icon: const Icon(Icons.star, color: Colors.amber, size: 32),
+              onPressed: _showFavorites,
+            ),
+          )),
       if (_position != null)
         Marker(
           point: LatLng(_position!.latitude, _position!.longitude),
@@ -1799,7 +1896,7 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
               shape: BoxShape.circle,
               border: Border.all(color: Colors.white, width: 3),
               boxShadow: const [
-                BoxShadow(color: Colors.black26, blurRadius: 4),
+                BoxShadow(color: Colors.black26, blurRadius: 4)
               ],
             ),
           ),
@@ -1876,11 +1973,9 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                                       ? null
                                       : _setDestination,
                                   icon: const Icon(Icons.place),
-                                  label: Text(
-                                    _resolvingDestination
-                                        ? '주소 검색 중...'
-                                        : '목적지 설정',
-                                  ),
+                                  label: Text(_resolvingDestination
+                                      ? '주소 검색 중...'
+                                      : '목적지 설정'),
                                 ),
                               ),
                               const SizedBox(width: 8),
@@ -1900,30 +1995,23 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                                   ? null
                                   : _importGpsFile,
                               icon: const Icon(Icons.file_open),
-                              label: const Text(
-                                'GPS 파일 불러오기 (GPX · CSV · TXT)',
-                              ),
+                              label:
+                                  const Text('GPS 파일 불러오기 (GPX · CSV · TXT)'),
                             ),
                           ),
                           const SizedBox(height: 4),
-                          Text(
-                            '선택: $_destinationLabel',
-                            maxLines: 1,
-                            overflow: TextOverflow.ellipsis,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
+                          Text('선택: $_destinationLabel',
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: Theme.of(context).textTheme.bodySmall),
                           const SizedBox(height: 4),
-                          Text(
-                            _walkingMeters == null
-                                ? _distanceLabel
-                                : '도보 경로 ${(_walkingMeters! / 1000).toStringAsFixed(2)} km'
-                                      '${_walkingSeconds == null ? '' : ' · 약 ${(_walkingSeconds! / 60).ceil()}분'}',
-                          ),
+                          Text(_walkingMeters == null
+                              ? _distanceLabel
+                              : '도보 경로 ${(_walkingMeters! / 1000).toStringAsFixed(2)} km'
+                                  '${_walkingSeconds == null ? '' : ' · 약 ${(_walkingSeconds! / 60).ceil()}분'}'),
                           const SizedBox(height: 3),
-                          Text(
-                            _gpsHealthText,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
+                          Text(_gpsHealthText,
+                              style: Theme.of(context).textTheme.bodySmall),
                         ],
                       ),
                     ),
@@ -1936,9 +2024,8 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                           FilledButton.icon(
                             onPressed: _routing ? null : _loadWalkingRoute,
                             icon: const Icon(Icons.route),
-                            label: Text(
-                              _routing ? '경로 조회 중...' : '앱 안에 도보 경로 표시',
-                            ),
+                            label:
+                                Text(_routing ? '경로 조회 중...' : '앱 안에 도보 경로 표시'),
                           ),
                           const SizedBox(height: 6),
                           Row(
@@ -1948,20 +2035,16 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                                   onPressed: (_startingNavigation || _routing)
                                       ? null
                                       : (_voiceOn || _voiceRoute != null)
-                                      ? _beginVoiceNavigation
-                                      : null,
-                                  icon: Icon(
-                                    _voiceOn
-                                        ? Icons.volume_off
-                                        : Icons.volume_up,
-                                  ),
-                                  label: Text(
-                                    _startingNavigation
-                                        ? '현재 GPS 확인 중...'
-                                        : _voiceOn
-                                        ? '음성안내 중지'
-                                        : '한국어 음성안내 시작',
-                                  ),
+                                          ? _beginVoiceNavigation
+                                          : null,
+                                  icon: Icon(_voiceOn
+                                      ? Icons.volume_off
+                                      : Icons.volume_up),
+                                  label: Text(_startingNavigation
+                                      ? '현재 GPS 확인 중...'
+                                      : _voiceOn
+                                          ? '음성안내 중지'
+                                          : '한국어 음성안내 시작'),
                                 ),
                               ),
                               IconButton(
@@ -1971,10 +2054,8 @@ class _WalkingHomePageState extends State<WalkingHomePage> {
                               ),
                             ],
                           ),
-                          Text(
-                            _voiceStatus,
-                            style: Theme.of(context).textTheme.bodySmall,
-                          ),
+                          Text(_voiceStatus,
+                              style: Theme.of(context).textTheme.bodySmall),
                           const SizedBox(height: 6),
                           OutlinedButton.icon(
                             onPressed: _startWalkingNavigation,
@@ -2009,59 +2090,41 @@ class AppLegalPage extends StatelessWidget {
       body: ListView(
         padding: const EdgeInsets.all(16),
         children: [
-          const Text(
-            '좌표 도보 길안내',
-            style: TextStyle(fontSize: 23, fontWeight: FontWeight.bold),
-          ),
+          const Text('좌표 도보 길안내',
+              style: TextStyle(fontSize: 23, fontWeight: FontWeight.bold)),
           const SizedBox(height: 8),
           const Text('제작자: 김완호\n버전: 1.5.5\n© 2026 김완호. All rights reserved.'),
           const SizedBox(height: 16),
-          const Text(
-            '이용 시 유의사항',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const Text(
-            '지도와 경로 데이터는 실제 도로 상태와 다를 수 있습니다. '
-            '이동 중 화면을 계속 보지 말고 주변 안전표지, 통행 제한 및 현장 안내를 우선하세요. '
-            '경로 제공이 중단되거나 정확하지 않을 수 있습니다.',
-          ),
+          const Text('이용 시 유의사항',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text('지도와 경로 데이터는 실제 도로 상태와 다를 수 있습니다. '
+              '이동 중 화면을 계속 보지 말고 주변 안전표지, 통행 제한 및 현장 안내를 우선하세요. '
+              '경로 제공이 중단되거나 정확하지 않을 수 있습니다.'),
           const SizedBox(height: 16),
-          const Text(
-            '위치정보 및 개인정보 안내',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const Text(
-            '앱 사용 중 GPS 위치 접근 권한을 요청합니다. 보행 경로 조회를 누르면 '
-            '현재 위치와 목적지 좌표가 경로조회 서버 및 외부 경로 제공자에 전달됩니다. '
-            '앱의 즐겨찾기에 직접 저장한 장소 이름과 GPS 좌표는 휴대폰 내부에 저장됩니다. 이동 기록은 저장하지 않습니다. '
-            '다만 실제 서버 운영자의 로그·보관 및 제공사 처리 방식은 '
-            '배포 전에 확인해 별도 개인정보 처리방침에 명시해야 합니다. '
-            '실제 개인정보 처리방침은 앱 배포 전에 작성·게시되어야 합니다.',
-          ),
+          const Text('위치정보 및 개인정보 안내',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text('앱 사용 중 GPS 위치 접근 권한을 요청합니다. 보행 경로 조회를 누르면 '
+              '현재 위치와 목적지 좌표가 경로조회 서버 및 외부 경로 제공자에 전달됩니다. '
+              '앱의 즐겨찾기에 직접 저장한 장소 이름과 GPS 좌표는 휴대폰 내부에 저장됩니다. 이동 기록은 저장하지 않습니다. '
+              '다만 실제 서버 운영자의 로그·보관 및 제공사 처리 방식은 '
+              '배포 전에 확인해 별도 개인정보 처리방침에 명시해야 합니다. '
+              '실제 개인정보 처리방침은 앱 배포 전에 작성·게시되어야 합니다.'),
           const SizedBox(height: 16),
-          const Text(
-            '지도 데이터 및 오픈소스',
-            style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-          ),
-          const Text(
-            '지도와 경로 데이터는 OpenStreetMap 기여자에게 권리가 있으며, '
-            '보행 경로 계산에는 FOSSGIS가 운영하는 공개 Valhalla 데모 서버를 사용합니다. '
-            '공개 서버에는 가용성 보장이 없고 사용량 제한이 적용될 수 있으므로 '
-            '공개 배포 전에는 운영자가 직접 관리하는 지도·경로 서비스를 연결해야 합니다.',
-          ),
+          const Text('지도 데이터 및 오픈소스',
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold)),
+          const Text('지도와 경로 데이터는 OpenStreetMap 기여자에게 권리가 있으며, '
+              '보행 경로 계산에는 FOSSGIS가 운영하는 공개 Valhalla 데모 서버를 사용합니다. '
+              '공개 서버에는 가용성 보장이 없고 사용량 제한이 적용될 수 있으므로 '
+              '공개 배포 전에는 운영자가 직접 관리하는 지도·경로 서비스를 연결해야 합니다.'),
           const SizedBox(height: 12),
-          const Text(
-            '주소 검색은 Android의 기기 지오코딩 서비스를 이용하며 '
-            '네트워크 연결 및 제공자의 서버 처리가 발생할 수 있습니다. '
-            '검색 결과는 실제 주소와 다를 수 있으므로 좌표를 확인하세요.',
-          ),
+          const Text('주소 검색은 Android의 기기 지오코딩 서비스를 이용하며 '
+              '네트워크 연결 및 제공자의 서버 처리가 발생할 수 있습니다. '
+              '검색 결과는 실제 주소와 다를 수 있으므로 좌표를 확인하세요.'),
           const SizedBox(height: 12),
-          const Text(
-            '한국어 음성은 갤럭시의 TTS 기능을 사용하며, '
-            '보행 경로가 정상적으로 조회된 경우에만 회전 지점을 안내합니다. '
-            '이 버전은 앱이 화면에 표시될 때만 위치를 추적합니다. '
-            'GPS 오차 및 경로 서버 상태에 따라 안내가 부정확할 수 있습니다.',
-          ),
+          const Text('한국어 음성은 갤럭시의 TTS 기능을 사용하며, '
+              '보행 경로가 정상적으로 조회된 경우에만 회전 지점을 안내합니다. '
+              '이 버전은 앱이 화면에 표시될 때만 위치를 추적합니다. '
+              'GPS 오차 및 경로 서버 상태에 따라 안내가 부정확할 수 있습니다.'),
           const SizedBox(height: 12),
           OutlinedButton.icon(
             onPressed: () => showLicensePage(
@@ -2084,10 +2147,8 @@ class AppLegalPage extends StatelessWidget {
               label: const Text('개인정보 처리방침 확인'),
             )
           else
-            const Text(
-              '테스트 배포 전 개인정보 처리방침 URL을 등록해야 합니다.',
-              style: TextStyle(color: Colors.deepOrange),
-            ),
+            const Text('테스트 배포 전 개인정보 처리방침 URL을 등록해야 합니다.',
+                style: TextStyle(color: Colors.deepOrange)),
         ],
       ),
     );

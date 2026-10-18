@@ -14,9 +14,7 @@ void main() {
     expect(p.latitude, 37.5665);
     expect(p.longitude, 126.978);
     expect(
-      GpsInputParser.parse('위도: 37.5665 경도: 126.9780')!.longitude,
-      126.978,
-    );
+        GpsInputParser.parse('위도: 37.5665 경도: 126.9780')!.longitude, 126.978);
   });
 
   test('드론의 도분초 좌표를 십진수로 변환', () {
@@ -36,37 +34,31 @@ void main() {
 
   test('Google Maps 좌표 링크, Android geo URI', () {
     expect(
-      GpsInputParser.parse(
-        'https://www.google.com/maps/search/?api=1&query=37.5665%2C126.978',
-      )!.latitude,
-      37.5665,
-    );
+        GpsInputParser.parse(
+                'https://www.google.com/maps/search/?api=1&query=37.5665%2C126.978')!
+            .latitude,
+        37.5665);
     expect(
-      GpsInputParser.parse('geo:37.5665,126.978;u=20')!.longitude,
-      126.978,
-    );
+        GpsInputParser.parse('geo:37.5665,126.978;u=20')!.longitude, 126.978);
   });
 
   test('GPX 첫 지점 및 CSV/TXT 파일 지점 목록', () {
-    final gpx =
-        '<gpx><wpt lat="37.5665" lon="126.9780"/>'
+    final gpx = '<gpx><wpt lat="37.5665" lon="126.9780"/>'
         '<wpt lat="37.5670" lon="126.9790"/></gpx>';
     final points = GpsInputParser.parseFileText(gpx);
     expect(points.length, 2);
     expect(points.last.latitude, 37.567);
     expect(
-      GpsInputParser.parseFileText(
-        'timestamp,latitude,longitude\n123,37.5665,126.978\n124,37.567,126.979'
-            .replaceAll(r'\n', '\n'),
-      ).length,
-      2,
-    );
+        GpsInputParser.parseFileText(
+                'timestamp,latitude,longitude\n123,37.5665,126.978\n124,37.567,126.979'
+                    .replaceAll(r'\n', '\n'))
+            .length,
+        2);
     expect(
-      GpsInputParser.parseFileText(
-        '37.5665,126.978\n37.567,126.979'.replaceAll(r'\n', '\n'),
-      ).length,
-      2,
-    );
+        GpsInputParser.parseFileText(
+                '37.5665,126.978\n37.567,126.979'.replaceAll(r'\n', '\n'))
+            .length,
+        2);
   });
 
   test('일반 한국 주소, 잘못된 좌표는 좌표로 인식하지 않음', () {
