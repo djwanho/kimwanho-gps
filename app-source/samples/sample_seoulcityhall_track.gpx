@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<gpx version="1.1" creator="KimWanHo GPX compatibility test"
+ xmlns="http://www.topografix.com/GPX/1/1">
+  <metadata><name>서울시청 인식 시험</name></metadata>
+  <trk>
+    <name>서울시청 예시</name>
+    <trkseg>
+      <trkpt lat="37.5665000" lon="126.9780000"><ele>40</ele></trkpt>
+      <trkpt lat="37.5667000" lon="126.9783000"><ele>41</ele></trkpt>
+    </trkseg>
+  </trk>
+</gpx>

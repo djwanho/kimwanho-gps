@@ -1,0 +1,15 @@
+.dart_tool/
+build/
+.flutter-plugins*
+*.iml
+.idea/
+android/local.properties
+**/.DS_Store
+
+# Never commit Play Console upload keys or signing secrets
+android/key.properties
+android/*.jks
+android/*.keystore
+*.aab
+*.jks
+*.keystore

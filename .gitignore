@@ -4,4 +4,9 @@ Thumbs.db
 *.jks
 *.keystore
 *.dpapi
+app-source/android/key.properties
+app-source/android/local.properties
+app-source/.dart_tool/
+app-source/build/
+app-source/android/.gradle/
 

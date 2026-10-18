@@ -1,0 +1,31 @@
+name: walk_pin_navigator
+description: 김완호 GPS 통합 도보 길안내 (주소, GPS 좌표, 보행 경로, 한국어 TTS)
+publish_to: none
+version: 1.5.8+14
+
+environment:
+  sdk: '>=3.5.0 <4.0.0'
+
+dependencies:
+  flutter:
+    sdk: flutter
+  flutter_map: ^8.3.2
+  latlong2: ^0.10.1
+  geolocator: ^14.1.1
+  url_launcher: ^6.3.2
+  http: ^1.4.0
+  flutter_tts: ^4.2.5
+  geocoding: ^5.0.0
+  file_picker: ^13.1.0
+  xml: ^7.0.1
+  flutter_compass: ^0.8.1
+  shared_preferences: 2.5.3
+
+dev_dependencies:
+  flutter_test:
+    sdk: flutter
+  flutter_lints: ^6.0.0
+  shared_preferences_platform_interface: ^2.4.2
+
+flutter:
+  uses-material-design: true
